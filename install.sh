@@ -72,5 +72,15 @@ else
     echo "Or add $INSTALL_DIR to your PATH if not already."
 fi
 
+# --- Sudo notice ---
+echo -e "\n${YELLOW}Note: If you need to run NScout with 'sudo', you may encounter 'command not found'.${NC}"
+echo "This is because /usr/local/bin is not always in sudo's secure_path."
+echo "To fix this, you can:"
+echo "  1) Use the full path: sudo /usr/local/bin/nscout"
+echo "  2) Add /usr/local/bin to sudo's secure_path (run 'sudo visudo' and add:)"
+echo "       Defaults    secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
+echo "  3) Create a symlink: sudo ln -s /usr/local/bin/nscout /usr/bin/nscout"
+echo -e "${GREEN}After that, 'sudo nscout' will work as expected.${NC}"
+
 echo -e "\n${GREEN}Thank you for installing NScout!${NC}"
 echo -e "Happy scanning! 📡"
