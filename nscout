@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+
+# NScout - focused network inventory scanner.
+# Use only on networks and systems you own or have permission to test.
+
+set -o pipefail
+
+PROG_NAME="NScout"
+VERSION="3.1.0"
+SESSION_ID="$(date +%Y%m%d_%H%M%S)"
+RUNTIME_DIR="$(mktemp -d 2>/dev/null || printf "%s/nscout_%s_%s" "${TMPDIR:-/tmp}" "$SESSION_ID" "$$")"
+HOSTS_FILE="$RUNTIME_DIR/hosts.txt"
+TARGET=""
+LAST_BASE=""
+ACTION_STATUS="Ready."
+
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    WHITE=$'\033[1;37m'
+    DIM=$'\033[2m'
+    BOLD=$'\033[1m'
+    NC=$'\033[0m'
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    CYAN=""
+    WHITE=""
+    DIM=""
+    BOLD=""
+    NC=""
+fi
+
+info() { printf "%s[INFO]%s %s\n" "$BLUE" "$NC" "$*"; }
+ok() { printf "%s[OK]%s %s\n" "$GREEN" "$NC" "$*"; }
+warn() { printf "%s[WARN]%s %s\n" "$YELLOW" "$NC" "$*"; }
+err() { printf "%s[ERR]%s %s\n" "$RED" "$NC" "$*" >&2; }
+
+clear_screen() {
+    if [ -t 1 ] && command -v clear >/dev/null 2>&1; then
+        clear
+    fi
+}
+
+pause() {
+    printf "\nPress Enter to continue..."
+    read -r _
+}
+
+ensure_session_dir() {
+    mkdir -p "$RUNTIME_DIR"
+}
+
+cleanup_runtime() {
+    rm -f "$HOSTS_FILE" "$RUNTIME_DIR"/*.gnmap 2>/dev/null || true
+    rmdir "$RUNTIME_DIR" 2>/dev/null || true
+}
+
+is_root() {
+    [ "$(id -u 2>/dev/null || printf 1)" = "0" ]
+}
+
+check_nmap() {
+    if ! command -v nmap >/dev/null 2>&1; then
+        err "nmap is not installed or not in PATH."
+        err "Install it first, for example: sudo apt update && sudo apt install nmap"
+        exit 1
+    fi
+}
+
+detect_default_cidr() {
+    local iface cidr ip_addr a b c d
+
+    if command -v ip >/dev/null 2>&1; then
+        iface="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
+        if [ -n "$iface" ]; then
+            cidr="$(ip -o -f inet addr show dev "$iface" scope global 2>/dev/null | awk 'NR==1 {print $4; exit}')"
+            if [ -n "$cidr" ]; then
+                printf "%s\n" "$cidr"
+                return 0
+            fi
+        fi
+
+        cidr="$(ip -o -f inet addr show scope global 2>/dev/null | awk 'NR==1 {print $4; exit}')"
+        if [ -n "$cidr" ]; then
+            printf "%s\n" "$cidr"
+            return 0
+        fi
+    fi
+
+    if command -v hostname >/dev/null 2>&1; then
+        ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        if [ -n "$ip_addr" ]; then
+            IFS=. read -r a b c d <<EOF
+$ip_addr
+EOF
+            if [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ]; then
+                printf "%s.%s.%s.0/24\n" "$a" "$b" "$c"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+print_command() {
+    local part
+    printf "Command:"
+    for part in "$@"; do
+        printf " %q" "$part"
+    done
+    printf "\n"
+}
+
+run_nmap() {
+    local scan_name="$1"
+    local output_name="$2"
+    shift 2
+
+    local stamp status
+    local -a cmd
+
+    stamp="$(date +%H%M%S)"
+    LAST_BASE="${output_name}_${stamp}"
+    ensure_session_dir
+
+    cmd=("nmap")
+    cmd+=("$@")
+
+    printf "\n%s%s%s\n" "$BOLD" "$scan_name" "$NC"
+    print_command "${cmd[@]}"
+    printf "\n"
+
+    "${cmd[@]}" 2>&1
+    status="$?"
+
+    if [ "$status" -ne 0 ]; then
+        err "Scan failed with exit code $status."
+        ACTION_STATUS="$scan_name failed with exit code $status."
+    else
+        ACTION_STATUS="$scan_name completed."
+    fi
+
+    return "$status"
+}
+
+set_target() {
+    local detected input
+    detected="$(detect_default_cidr || true)"
+
+    printf "\n"
+    if [ -n "$detected" ]; then
+        printf "Target network or host [%s]: " "$detected"
+        read -r input
+        TARGET="${input:-$detected}"
+    else
+        printf "Target network or host: "
+        read -r TARGET
+    fi
+
+    if [ -z "$TARGET" ]; then
+        err "No target was set."
+        return 1
+    fi
+
+    ok "Target set to $TARGET"
+    ACTION_STATUS="Target set to $TARGET."
+}
+
+ensure_target() {
+    if [ -z "$TARGET" ]; then
+        set_target
+    fi
+}
+
+extract_live_hosts() {
+    local gnmap_file="$1"
+    local count
+
+    ensure_session_dir
+    : > "$HOSTS_FILE"
+
+    if [ -f "$gnmap_file" ]; then
+        awk '/Status: Up/ {print $2}' "$gnmap_file" | sort -u > "$HOSTS_FILE"
+    fi
+
+    count="$(wc -l < "$HOSTS_FILE" 2>/dev/null | tr -d ' ')"
+    count="${count:-0}"
+
+    if [ "$count" -gt 0 ]; then
+        ok "Discovered $count live host(s)."
+        info "Host list: $HOSTS_FILE"
+        sed 's/^/  /' "$HOSTS_FILE"
+        ACTION_STATUS="Discovered $count live host(s)."
+        return 0
+    fi
+
+    warn "No live hosts were found."
+    ACTION_STATUS="No live hosts were found."
+    return 1
+}
+
+discover_live_hosts() {
+    ensure_target || return 1
+    local temp_gnmap="$RUNTIME_DIR/live_discovery.gnmap"
+
+    ensure_session_dir
+    run_nmap "Discover live devices" "live_discovery" -oG "$temp_gnmap" -sn "$TARGET" || return 1
+    extract_live_hosts "$temp_gnmap"
+    rm -f "$temp_gnmap"
+}
+
+arp_discovery() {
+    ensure_target || return 1
+    local temp_gnmap="$RUNTIME_DIR/arp_discovery.gnmap"
+
+    if ! is_root; then
+        warn "ARP discovery works best with sudo on local networks."
+    fi
+
+    ensure_session_dir
+    run_nmap "Local ARP discovery" "arp_discovery" -oG "$temp_gnmap" -PR -sn "$TARGET" || return 1
+    extract_live_hosts "$temp_gnmap"
+    rm -f "$temp_gnmap"
+}
+
+prepare_inventory_targets() {
+    SCAN_TARGET_ARGS=()
+
+    if [ -s "$HOSTS_FILE" ]; then
+        SCAN_TARGET_ARGS=("-iL" "$HOSTS_FILE")
+        return 0
+    fi
+
+    warn "No host list is available. Run discovery first or scan the target directly."
+    printf "Scan %s directly with -Pn? [y/N]: " "$TARGET"
+    read -r answer
+    case "$answer" in
+        y|Y|yes|YES)
+            SCAN_TARGET_ARGS=("-Pn" "$TARGET")
+            return 0
+            ;;
+        *)
+            warn "Scan cancelled."
+            return 1
+            ;;
+    esac
+}
+
+tcp_scan_flag() {
+    if is_root; then
+        printf "%s\n" "-sS"
+    else
+        printf "%s\n" "-sT"
+    fi
+}
+
+common_ports() {
+    printf "%s\n" "21,22,23,25,53,80,110,111,135,139,143,389,443,445,465,587,993,995,1433,1521,2049,3306,3389,5432,5900,5985,6379,8080,8443,9200"
+}
+
+confirm_slow_scan() {
+    local label="$1"
+    local answer
+
+    printf "\n%s can take a long time and may generate heavy traffic.\n" "$label"
+    printf "Continue? [y/N]: "
+    read -r answer
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *)
+            warn "Scan cancelled."
+            ACTION_STATUS="$label cancelled."
+            return 1
+            ;;
+    esac
+}
+
+dns_list_scan() {
+    ensure_target || return 1
+    run_nmap "DNS/list scan" "dns_list_scan" -sL "$TARGET"
+}
+
+quick_scan() {
+    ensure_target || return 1
+    run_nmap "Quick scan: common ports" "quick_scan" -F --open "$TARGET"
+}
+
+common_services_scan() {
+    ensure_target || return 1
+    run_nmap "Common services scan" "common_services" -sV --open -p "$(common_ports)" "$TARGET"
+}
+
+all_tcp_ports_scan() {
+    ensure_target || return 1
+    confirm_slow_scan "All TCP ports scan" || return 1
+    run_nmap "All TCP ports scan" "all_tcp_ports" "$(tcp_scan_flag)" -p- --open --reason "$TARGET"
+}
+
+all_tcp_udp_ports_scan() {
+    ensure_target || return 1
+    confirm_slow_scan "All TCP and UDP ports scan" || return 1
+
+    if ! is_root; then
+        warn "UDP scans are more accurate with sudo."
+    fi
+
+    info "Step 1 of 2: scanning all TCP ports."
+    run_nmap "All ports scan: TCP" "all_ports_tcp" "$(tcp_scan_flag)" -p- --open --reason "$TARGET" || return 1
+
+    info "Step 2 of 2: scanning all UDP ports."
+    run_nmap "All ports scan: UDP" "all_ports_udp" -sU -p- --open "$TARGET"
+}
+
+service_version_scan() {
+    ensure_target || return 1
+    run_nmap "Service/version detection" "service_versions" -sV --open "$TARGET"
+}
+
+os_traceroute_scan() {
+    ensure_target || return 1
+
+    if is_root; then
+        run_nmap "OS detection and traceroute" "os_traceroute" -O --osscan-guess --traceroute --reason "$TARGET"
+    else
+        warn "OS detection needs sudo. Running traceroute and service detection instead."
+        run_nmap "Traceroute and service detection" "traceroute_no_root" --traceroute -sV --open "$TARGET"
+    fi
+}
+
+udp_top_ports_scan() {
+    ensure_target || return 1
+
+    if ! is_root; then
+        warn "UDP scans are more accurate with sudo."
+    fi
+
+    run_nmap "UDP top ports scan" "udp_top_ports" -sU --top-ports 100 --open "$TARGET"
+}
+
+ipv6_scan() {
+    local ipv6_target
+
+    printf "\nIPv6 target or range"
+    if [ -n "$TARGET" ]; then
+        printf " [%s]" "$TARGET"
+    fi
+    printf ": "
+    read -r ipv6_target
+    ipv6_target="${ipv6_target:-$TARGET}"
+
+    if [ -z "$ipv6_target" ]; then
+        err "No IPv6 target was set."
+        return 1
+    fi
+
+    run_nmap "IPv6 scan" "ipv6_scan" -6 -sV --open "$ipv6_target"
+}
+
+full_inventory() {
+    ensure_target || return 1
+
+    info "Step 1 of 2: discovering live hosts."
+    discover_live_hosts || true
+    prepare_inventory_targets || return 1
+
+    info "Step 2 of 2: scanning all TCP ports and service versions."
+    run_nmap "Full inventory" "full_inventory_tcp" "$(tcp_scan_flag)" -p- --open -sV --reason "${SCAN_TARGET_ARGS[@]}"
+}
+
+deep_inventory() {
+    ensure_target || return 1
+
+    info "Step 1 of 4: discovering live hosts."
+    discover_live_hosts || true
+    prepare_inventory_targets || return 1
+
+    info "Step 2 of 4: scanning all TCP ports and service versions."
+    run_nmap "Deep inventory: TCP" "deep_inventory_tcp" "$(tcp_scan_flag)" -p- --open -sV --reason "${SCAN_TARGET_ARGS[@]}"
+
+    info "Step 3 of 4: scanning UDP top ports."
+    if ! is_root; then
+        warn "UDP scans are more accurate with sudo."
+    fi
+    run_nmap "Deep inventory: UDP" "deep_inventory_udp" -sU --top-ports 100 --open "${SCAN_TARGET_ARGS[@]}"
+
+    info "Step 4 of 4: OS detection and traceroute."
+    if is_root; then
+        run_nmap "Deep inventory: OS and traceroute" "deep_inventory_os" -O --osscan-guess --traceroute --reason "${SCAN_TARGET_ARGS[@]}"
+    else
+        warn "OS detection needs sudo. Running traceroute only."
+        run_nmap "Deep inventory: traceroute" "deep_inventory_traceroute" --traceroute "${SCAN_TARGET_ARGS[@]}"
+    fi
+}
+
+show_discovered_hosts() {
+    printf "\n"
+    if [ -s "$HOSTS_FILE" ]; then
+        info "Discovered hosts in this session:"
+        sed 's/^/  /' "$HOSTS_FILE"
+        ACTION_STATUS="Displayed discovered hosts."
+    else
+        warn "No discovered hosts yet. Run option 2 or 3 first."
+        ACTION_STATUS="No discovered hosts to show."
+    fi
+}
+
+print_logo() {
+    # ──────────────────────────────────────────────
+    #  NScout – Professional Banner (no external tools)
+    # ──────────────────────────────────────────────
+    printf "%b" "${CYAN}"
+    cat <<'EOF'
+   ███╗   ██╗███████╗ ██████╗ ██████╗ ██╗   ██╗████████╗
+   ████╗  ██║██╔════╝██╔════╝██╔═══██╗██║   ██║╚══██╔══╝
+   ██╔██╗ ██║███████╗██║     ██║   ██║██║   ██║   ██║   
+   ██║╚██╗██║╚════██║██║     ██║   ██║██║   ██║   ██║   
+   ██║ ╚████║███████║╚██████╗╚██████╔╝╚██████╔╝   ██║   
+   ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝   
+EOF
+    printf "%b" "${NC}"
+    # Separator & credits
+    printf "%b" "${DIM}${WHITE}"
+    echo "  ───────────────────────────────────────────────────────────────"
+    echo "  Built by: Ahmed Emad   | Abdallah Negeada"
+    echo "            Mohamed Nagy | Abdallah Salman"
+    printf "%b" "${NC}"
+    echo
+}
+
+fit_text() {
+    local text="$1"
+    local width="$2"
+
+    if [ "${#text}" -gt "$width" ]; then
+        printf "%s..." "${text:0:$((width - 3))}"
+    else
+        printf "%s" "$text"
+    fi
+}
+
+print_menu() {
+    local target_text status_text
+
+    target_text="$(fit_text "${TARGET:-not set}" 51)"
+    status_text="$(fit_text "$ACTION_STATUS" 51)"
+
+    clear_screen
+    print_logo
+    printf "\n"
+    printf "%s\n" "+-------------------------------------------------------------+"
+    printf "| Target : %-51s|\n" "$target_text"
+    printf "| Status : %-51s|\n" "$status_text"
+    printf "%s\n" "+-------------------------------------------------------------+"
+    printf "| %-58s  |\n" "1)  Set target network or host"
+    printf "| %-58s  |\n" "2)  Discover live devices"
+    printf "| %-58s  |\n" "3)  Local ARP discovery"
+    printf "| %-58s  |\n" "4)  DNS/list scan"
+    printf "| %-58s  |\n" "5)  Quick scan"
+    printf "| %-58s  |\n" "6)  Common services scan"
+    printf "| %-58s  |\n" "7)  All TCP ports scan"
+    printf "| %-58s  |\n" "8)  All TCP and UDP ports scan"
+    printf "| %-58s  |\n" "9)  Service/version detection"
+    printf "| %-58s  |\n" "10) OS detection and traceroute"
+    printf "| %-58s  |\n" "11) UDP top ports scan"
+    printf "| %-58s  |\n" "12) IPv6 scan mode"
+    printf "| %-58s  |\n" "13) Full inventory"
+    printf "| %-58s  |\n" "14) Deep inventory"
+    printf "| %-58s  |\n" "15) Show discovered hosts"
+    printf "| %-58s  |\n" "0)  Exit"
+    printf "%s\n" "+-------------------------------------------------------------+"
+}
+
+show_help() {
+    cat <<EOF
+$PROG_NAME Help
+
+Usage:
+  ./nscout.sh [target]
+  ./nscout.sh --help
+
+Run without arguments to open the scanner menu.
+
+Examples:
+  ./nscout.sh
+  ./nscout.sh 192.168.1.0/24
+  ./nscout.sh 10.10.10.5
+
+Notes:
+  Full TCP and UDP scans can be slow. Use them only on networks you are allowed to test.
+EOF
+}
+
+parse_args() {
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                TARGET="$arg"
+                ;;
+        esac
+    done
+}
+
+main_menu() {
+    local choice
+
+    while true; do
+        print_menu
+        printf "Choose an option: "
+        read -r choice
+
+        case "$choice" in
+            1) set_target; pause ;;
+            2) discover_live_hosts; pause ;;
+            3) arp_discovery; pause ;;
+            4) dns_list_scan; pause ;;
+            5) quick_scan; pause ;;
+            6) common_services_scan; pause ;;
+            7) all_tcp_ports_scan; pause ;;
+            8) all_tcp_udp_ports_scan; pause ;;
+            9) service_version_scan; pause ;;
+            10) os_traceroute_scan; pause ;;
+            11) udp_top_ports_scan; pause ;;
+            12) ipv6_scan; pause ;;
+            13) full_inventory; pause ;;
+            14) deep_inventory; pause ;;
+            15) show_discovered_hosts; pause ;;
+            0|q|Q)
+                printf "Goodbye.\n"
+                exit 0
+                ;;
+            *)
+                err "Invalid option."
+                pause
+                ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+    ensure_session_dir
+    trap cleanup_runtime EXIT
+    check_nmap
+    main_menu
+}
+
+main "$@"
