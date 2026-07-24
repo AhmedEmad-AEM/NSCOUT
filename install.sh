@@ -31,7 +31,6 @@ if ! command -v nmap >/dev/null 2>&1; then
     fi
 fi
 
-# Check if nmap is now installed
 if ! command -v nmap >/dev/null 2>&1; then
     echo -e "${RED}nmap is still not available. Please install it manually.${NC}"
     exit 1
@@ -39,16 +38,9 @@ fi
 
 echo -e "${GREEN}nmap is installed.${NC}"
 
-# Determine installation directory
-INSTALL_DIR="/usr/local/bin"
-if [ ! -w "$INSTALL_DIR" ]; then
-    echo -e "${YELLOW}No write permission to $INSTALL_DIR. Trying with sudo...${NC}"
-    SUDO="sudo"
-else
-    SUDO=""
-fi
-
-# Copy the script
+# Determine installation directories
+PRIMARY_DIR="/usr/local/bin"
+SECONDARY_DIR="/usr/bin"
 SCRIPT_NAME="nscout"
 SOURCE_FILE="nscout"
 
@@ -58,29 +50,34 @@ if [ ! -f "$SOURCE_FILE" ]; then
     exit 1
 fi
 
-echo -e "\n${GREEN}Installing NScout to $INSTALL_DIR/$SCRIPT_NAME...${NC}"
-$SUDO cp "$SOURCE_FILE" "$INSTALL_DIR/$SCRIPT_NAME"
-$SUDO chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+# Install to primary location (/usr/local/bin)
+echo -e "\n${GREEN}Installing NScout to $PRIMARY_DIR/$SCRIPT_NAME...${NC}"
+sudo cp "$SOURCE_FILE" "$PRIMARY_DIR/$SCRIPT_NAME"
+sudo chmod +x "$PRIMARY_DIR/$SCRIPT_NAME"
 
-# Verify installation
+# Create symlink in /usr/bin so sudo can find it
+echo -e "${GREEN}Creating symlink in $SECONDARY_DIR/$SCRIPT_NAME...${NC}"
+sudo ln -sf "$PRIMARY_DIR/$SCRIPT_NAME" "$SECONDARY_DIR/$SCRIPT_NAME"
+
+# Verify installation (normal user)
 if command -v nscout >/dev/null 2>&1; then
     echo -e "\n${GREEN}✅ NScout installed successfully!${NC}"
     echo -e "You can now run it by typing: ${YELLOW}nscout${NC}"
 else
-    echo -e "\n${YELLOW}Installation completed, but 'nscout' command may not be in your PATH.${NC}"
-    echo "You can run it with: $INSTALL_DIR/$SCRIPT_NAME"
-    echo "Or add $INSTALL_DIR to your PATH if not already."
+    echo -e "\n${YELLOW}Installation completed, but 'nscout' may not be in your PATH.${NC}"
+    echo "You can run it with: $PRIMARY_DIR/$SCRIPT_NAME"
 fi
 
-# --- Sudo notice ---
-echo -e "\n${YELLOW}Note: If you need to run NScout with 'sudo', you may encounter 'command not found'.${NC}"
-echo "This is because /usr/local/bin is not always in sudo's secure_path."
-echo "To fix this, you can:"
-echo "  1) Use the full path: sudo /usr/local/bin/nscout"
-echo "  2) Add /usr/local/bin to sudo's secure_path (run 'sudo visudo' and add:)"
-echo "       Defaults    secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
-echo "  3) Create a symlink: sudo ln -s /usr/local/bin/nscout /usr/bin/nscout"
-echo -e "${GREEN}After that, 'sudo nscout' will work as expected.${NC}"
+# Verify sudo access
+if sudo -n true 2>/dev/null; then
+    if sudo command -v nscout >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 'sudo nscout' will also work.${NC}"
+    else
+        echo -e "${YELLOW}⚠️  'sudo nscout' might still not work. Try: sudo /usr/bin/nscout${NC}"
+    fi
+else
+    echo -e "${YELLOW}Note: If you need 'sudo nscout', ensure /usr/bin is in sudo's secure_path.${NC}"
+fi
 
 echo -e "\n${GREEN}Thank you for installing NScout!${NC}"
 echo -e "Happy scanning! 📡"
